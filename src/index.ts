@@ -16,10 +16,26 @@ const config = {
 	clientId: process.env.WHOOP_CLIENT_ID ?? '',
 	clientSecret: process.env.WHOOP_CLIENT_SECRET ?? '',
 	redirectUri: process.env.WHOOP_REDIRECT_URI ?? 'http://localhost:3000/callback',
+	// NOTE: on Railway, './whoop.db' is EPHEMERAL — tokens are wiped on every
+	// deploy/restart. Mount a volume and set DB_PATH to a path on it
+	// (e.g. /data/whoop.db) or you will have to re-authorize constantly.
 	dbPath: process.env.DB_PATH ?? './whoop.db',
 	port: Number.parseInt(process.env.PORT ?? '3000', 10),
 	mode: process.env.MCP_MODE ?? 'http',
 };
+
+// Fail loudly at startup if OAuth config is missing. A missing client secret
+// produces an auth URL that works but a token exchange that always fails —
+// exactly the "Authorization failed" symptom.
+const configProblems: string[] = [];
+if (!config.clientId) configProblems.push('WHOOP_CLIENT_ID is not set');
+if (!config.clientSecret) configProblems.push('WHOOP_CLIENT_SECRET is not set');
+if (config.mode !== 'stdio' && config.redirectUri.includes('localhost')) {
+	configProblems.push(`WHOOP_REDIRECT_URI is not set (falling back to ${config.redirectUri}, which will not work in production)`);
+}
+for (const problem of configProblems) {
+	process.stderr.write(`[config] WARNING: ${problem}\n`);
+}
 
 const db = new WhoopDatabase(config.dbPath);
 const client = new WhoopClient({
@@ -48,7 +64,6 @@ function cleanupStaleSessions(): void {
 		}
 	}
 }
-
 setInterval(cleanupStaleSessions, 5 * 60 * 1000);
 
 function formatDuration(millis: number | null): string {
@@ -92,9 +107,14 @@ function validateBoolean(value: unknown): boolean {
 	return false;
 }
 
+function errorMessage(error: unknown): string {
+	if (error instanceof Error) return error.message;
+	return String(error);
+}
+
 function createMcpServer(): Server {
 	const server = new Server(
-		{ name: 'whoop-mcp-server', version: '1.0.0' },
+		{ name: 'whoop-mcp-server', version: '1.0.1' },
 		{ capabilities: { tools: {} } }
 	);
 
@@ -152,7 +172,6 @@ function createMcpServer(): Server {
 	server.setRequestHandler(CallToolRequestSchema, async request => {
 		const { name, arguments: args } = request.params;
 		const typedArgs = (args ?? {}) as ToolArguments;
-
 		try {
 			const dataTools = ['get_today', 'get_recovery_trends', 'get_sleep_analysis', 'get_strain_history'];
 			if (dataTools.includes(name)) {
@@ -163,8 +182,9 @@ function createMcpServer(): Server {
 				client.setTokens(tokens);
 				try {
 					await sync.smartSync();
-				} catch {
-					// Continue with cached data
+				} catch (error) {
+					// Continue with cached data, but leave a trace in the logs.
+					process.stderr.write(`[sync] smartSync failed: ${errorMessage(error)}\n`);
 				}
 			}
 
@@ -173,13 +193,10 @@ function createMcpServer(): Server {
 					const recovery = db.getLatestRecovery();
 					const sleep = db.getLatestSleep();
 					const cycle = db.getLatestCycle();
-
 					if (!recovery && !sleep && !cycle) {
 						return { content: [{ type: 'text', text: 'No data available. Try running sync_data first.' }] };
 					}
-
 					let response = "# Today's Whoop Summary\n\n";
-
 					if (recovery) {
 						response += `## Recovery: ${recovery.recovery_score ?? 'N/A'}% ${recovery.recovery_score ? getRecoveryZone(recovery.recovery_score) : ''}\n`;
 						response += `- **HRV**: ${recovery.hrv_rmssd?.toFixed(1) ?? 'N/A'} ms\n`;
@@ -188,7 +205,6 @@ function createMcpServer(): Server {
 						if (recovery.skin_temp) response += `- **Skin Temp**: ${recovery.skin_temp.toFixed(1)}°C\n`;
 						response += '\n';
 					}
-
 					if (sleep) {
 						const totalSleep = (sleep.total_in_bed_milli ?? 0) - (sleep.total_awake_milli ?? 0);
 						response += `## Last Night's Sleep\n`;
@@ -199,7 +215,6 @@ function createMcpServer(): Server {
 						if (sleep.respiratory_rate) response += `- **Respiratory Rate**: ${sleep.respiratory_rate.toFixed(1)} breaths/min\n`;
 						response += '\n';
 					}
-
 					if (cycle) {
 						response += `## Current Strain\n`;
 						response += `- **Day Strain**: ${cycle.strain?.toFixed(1) ?? 'N/A'} ${cycle.strain ? getStrainZone(cycle.strain) : ''}\n`;
@@ -207,78 +222,59 @@ function createMcpServer(): Server {
 						if (cycle.avg_hr) response += `- **Avg HR**: ${cycle.avg_hr} bpm\n`;
 						if (cycle.max_hr) response += `- **Max HR**: ${cycle.max_hr} bpm\n`;
 					}
-
 					return { content: [{ type: 'text', text: response }] };
 				}
 
 				case 'get_recovery_trends': {
 					const days = validateDays(typedArgs.days);
 					const trends = db.getRecoveryTrends(days);
-
 					if (trends.length === 0) {
 						return { content: [{ type: 'text', text: 'No recovery data available for the requested period.' }] };
 					}
-
 					let response = `# Recovery Trends (Last ${days} Days)\n\n`;
 					response += '| Date | Recovery | HRV | RHR |\n|------|----------|-----|-----|\n';
-
 					for (const day of trends) {
 						response += `| ${formatDate(day.date)} | ${day.recovery_score}% | ${day.hrv?.toFixed(1) ?? 'N/A'} ms | ${day.rhr ?? 'N/A'} bpm |\n`;
 					}
-
 					const avgRecovery = trends.reduce((sum, d) => sum + (d.recovery_score || 0), 0) / trends.length;
 					const avgHrv = trends.reduce((sum, d) => sum + (d.hrv || 0), 0) / trends.length;
 					const avgRhr = trends.reduce((sum, d) => sum + (d.rhr || 0), 0) / trends.length;
-
 					response += `\n## Averages\n- **Recovery**: ${avgRecovery.toFixed(0)}%\n- **HRV**: ${avgHrv.toFixed(1)} ms\n- **RHR**: ${avgRhr.toFixed(0)} bpm\n`;
-
 					return { content: [{ type: 'text', text: response }] };
 				}
 
 				case 'get_sleep_analysis': {
 					const days = validateDays(typedArgs.days);
 					const trends = db.getSleepTrends(days);
-
 					if (trends.length === 0) {
 						return { content: [{ type: 'text', text: 'No sleep data available for the requested period.' }] };
 					}
-
 					let response = `# Sleep Analysis (Last ${days} Days)\n\n`;
 					response += '| Date | Duration | Performance | Efficiency |\n|------|----------|-------------|------------|\n';
-
 					for (const day of trends) {
 						response += `| ${formatDate(day.date)} | ${day.total_sleep_hours?.toFixed(1) ?? 'N/A'}h | ${day.performance?.toFixed(0) ?? 'N/A'}% | ${day.efficiency?.toFixed(0) ?? 'N/A'}% |\n`;
 					}
-
 					const avgDuration = trends.reduce((sum, d) => sum + (d.total_sleep_hours || 0), 0) / trends.length;
 					const avgPerf = trends.reduce((sum, d) => sum + (d.performance || 0), 0) / trends.length;
 					const avgEff = trends.reduce((sum, d) => sum + (d.efficiency || 0), 0) / trends.length;
-
 					response += `\n## Averages\n- **Duration**: ${avgDuration.toFixed(1)} hours\n- **Performance**: ${avgPerf.toFixed(0)}%\n- **Efficiency**: ${avgEff.toFixed(0)}%\n`;
-
 					return { content: [{ type: 'text', text: response }] };
 				}
 
 				case 'get_strain_history': {
 					const days = validateDays(typedArgs.days);
 					const trends = db.getStrainTrends(days);
-
 					if (trends.length === 0) {
 						return { content: [{ type: 'text', text: 'No strain data available for the requested period.' }] };
 					}
-
 					let response = `# Strain History (Last ${days} Days)\n\n`;
 					response += '| Date | Strain | Calories |\n|------|--------|----------|\n';
-
 					for (const day of trends) {
 						response += `| ${formatDate(day.date)} | ${day.strain?.toFixed(1) ?? 'N/A'} | ${day.calories ?? 'N/A'} kcal |\n`;
 					}
-
 					const avgStrain = trends.reduce((sum, d) => sum + (d.strain || 0), 0) / trends.length;
 					const avgCalories = trends.reduce((sum, d) => sum + (d.calories || 0), 0) / trends.length;
-
 					response += `\n## Averages\n- **Daily Strain**: ${avgStrain.toFixed(1)}\n- **Daily Calories**: ${Math.round(avgCalories)} kcal\n`;
-
 					return { content: [{ type: 'text', text: response }] };
 				}
 
@@ -288,10 +284,8 @@ function createMcpServer(): Server {
 						return { content: [{ type: 'text', text: 'Not authenticated with Whoop. Use get_auth_url to authorize first.' }] };
 					}
 					client.setTokens(tokens);
-
 					const full = validateBoolean(typedArgs.full);
 					let stats;
-
 					if (full) {
 						stats = await sync.syncDays(90);
 					} else {
@@ -301,7 +295,6 @@ function createMcpServer(): Server {
 						}
 						stats = result.stats;
 					}
-
 					return {
 						content: [{
 							type: 'text',
@@ -311,6 +304,15 @@ function createMcpServer(): Server {
 				}
 
 				case 'get_auth_url': {
+					if (configProblems.length > 0) {
+						return {
+							content: [{
+								type: 'text',
+								text: `Server is misconfigured — authorization will fail until this is fixed:\n- ${configProblems.join('\n- ')}\n\nSet these environment variables and redeploy.`,
+							}],
+							isError: true,
+						};
+					}
 					const scopes = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
 					const url = client.getAuthorizationUrl(scopes);
 					return {
@@ -325,8 +327,7 @@ function createMcpServer(): Server {
 					throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
 			}
 		} catch (error) {
-			const message = error instanceof Error ? error.message : 'Unknown error';
-			return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
+			return { content: [{ type: 'text', text: `Error: ${errorMessage(error)}` }], isError: true };
 		}
 	});
 
@@ -344,6 +345,16 @@ async function main(): Promise<void> {
 		app.use(express.json());
 
 		app.get('/callback', async (req: Request, res: Response) => {
+			// Whoop reports user-denied / config errors as query params — show them
+			// instead of a generic failure.
+			const oauthError = req.query.error as string | undefined;
+			if (oauthError) {
+				const description = (req.query.error_description as string | undefined) ?? 'no description provided';
+				process.stderr.write(`[oauth] Whoop returned error: ${oauthError} (${description})\n`);
+				res.status(400).send(`Whoop returned an error: ${oauthError} — ${description}`);
+				return;
+			}
+
 			const code = req.query.code as string | undefined;
 			if (!code) {
 				res.status(400).send('Missing authorization code');
@@ -353,15 +364,36 @@ async function main(): Promise<void> {
 			try {
 				const tokens = await client.exchangeCodeForTokens(code);
 				db.saveTokens(tokens);
-				sync.syncDays(90).catch(() => {});
+				sync.syncDays(90).catch(error => {
+					process.stderr.write(`[sync] Initial 90-day sync failed: ${errorMessage(error)}\n`);
+				});
 				res.send('Authorization successful! You can close this window.');
-			} catch {
-				res.status(500).send('Authorization failed. Please try again.');
+			} catch (error) {
+				// Log the full error and surface the message — a blind
+				// "Authorization failed" makes this impossible to debug.
+				const msg = errorMessage(error);
+				process.stderr.write(`[oauth] Token exchange failed: ${msg}\n`);
+				console.error(error);
+				res.status(500).send(
+					`Authorization failed during token exchange: ${msg}\n\n` +
+					'Common causes: WHOOP_CLIENT_SECRET missing or wrong, ' +
+					'redirect_uri mismatch with the Whoop app settings, ' +
+					'or an expired/reused authorization code (codes are single-use).'
+				);
 			}
 		});
 
 		app.get('/health', (_req: Request, res: Response) => {
-			res.json({ status: 'ok', authenticated: Boolean(db.getTokens()) });
+			res.json({
+				status: 'ok',
+				authenticated: Boolean(db.getTokens()),
+				config: {
+					clientIdSet: Boolean(config.clientId),
+					clientSecretSet: Boolean(config.clientSecret),
+					redirectUri: config.redirectUri,
+					configProblems,
+				},
+			});
 		});
 
 		app.all('/mcp', async (req: Request, res: Response) => {
@@ -377,7 +409,6 @@ async function main(): Promise<void> {
 
 			if (req.method === 'POST') {
 				let transport: StreamableHTTPServerTransport;
-
 				if (sessionId && transports.has(sessionId)) {
 					const session = transports.get(sessionId)!;
 					session.lastAccess = Date.now();
@@ -389,11 +420,9 @@ async function main(): Promise<void> {
 							transports.set(newSessionId, { transport, lastAccess: Date.now() });
 						},
 					});
-
 					const server = createMcpServer();
 					await server.connect(transport);
 				}
-
 				await transport.handleRequest(req, res, req.body);
 				return;
 			}
@@ -407,6 +436,9 @@ async function main(): Promise<void> {
 
 		const server = app.listen(config.port, '0.0.0.0', () => {
 			process.stdout.write(`Whoop MCP server running on http://0.0.0.0:${config.port}\n`);
+			if (configProblems.length > 0) {
+				process.stdout.write(`WARNING: ${configProblems.length} config problem(s) — see stderr. OAuth will fail until fixed.\n`);
+			}
 		});
 
 		const shutdown = (): void => {
@@ -418,7 +450,6 @@ async function main(): Promise<void> {
 			db.close();
 			server.close(() => process.exit(0));
 		};
-
 		process.on('SIGTERM', shutdown);
 		process.on('SIGINT', shutdown);
 	}
